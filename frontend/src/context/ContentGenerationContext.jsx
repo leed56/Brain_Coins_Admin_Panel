@@ -89,21 +89,23 @@ export const ContentGenerationProvider = ({ children }) => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [generationError, setGenerationError] = useState('');
+  const [generationStage, setGenerationStage] = useState('idle');
+  const [generationStatusText, setGenerationStatusText] = useState('');
   const [showUploadForm, setShowUploadForm] = useState(false);
   
   // Question type configuration
   const [questionTypeCounts, setQuestionTypeCounts] = useState({
-    MCQ: 5,
-    FIIB: 5,
-    TF: 5,
-    HOQ: 5
+    MCQ: 20,
+    FIIB: 15,
+    TF: 10,
+    HOQ: 3
   });
   
   const [questionTypeDifficulties, setQuestionTypeDifficulties] = useState({
     MCQ: 'Medium',
     FIIB: 'Medium',
-    TF: 'Medium',
-    HOQ: 'Medium'
+    TF: 'Easy',
+    HOQ: 'Hard'
   });
 
   // Reset all state (useful when starting fresh)
@@ -123,6 +125,8 @@ export const ContentGenerationProvider = ({ children }) => {
     setIsGenerating(false);
     setIsAnalyzing(false);
     setGenerationError('');
+    setGenerationStage('idle');
+    setGenerationStatusText('');
     setShowUploadForm(false);
     
     // Clear localStorage
@@ -141,6 +145,13 @@ export const ContentGenerationProvider = ({ children }) => {
     setSummaryBullets([]);
     setIsGenerating(false);
     setGenerationError('');
+    setGenerationStage('idle');
+    setGenerationStatusText('');
+  };
+
+  const setGenerationProgress = (stage, text = '') => {
+    setGenerationStage(stage || 'idle');
+    setGenerationStatusText(text || '');
   };
 
   return (
@@ -180,6 +191,11 @@ export const ContentGenerationProvider = ({ children }) => {
       setIsAnalyzing,
       generationError,
       setGenerationError,
+      generationStage,
+      setGenerationStage,
+      generationStatusText,
+      setGenerationStatusText,
+      setGenerationProgress,
       showUploadForm,
       setShowUploadForm,
       

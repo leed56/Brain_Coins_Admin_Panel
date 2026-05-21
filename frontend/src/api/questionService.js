@@ -3,13 +3,27 @@
  * Handles API calls to backend for question generation
  */
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+
+const normalizeQuestionType = (type) => {
+  const normalized = String(type || 'MCQ').trim().toUpperCase();
+  return normalized === 'FIB' ? 'FIIB' : normalized;
+};
+
+const normalizeCounts = (counts = {}) => {
+  return Object.entries(counts || {}).reduce((acc, [key, value]) => {
+    const type = normalizeQuestionType(key);
+    const count = parseInt(value, 10);
+    acc[type] = Math.max(0, Number.isNaN(count) ? 0 : count);
+    return acc;
+  }, {});
+};
 
 // Helper: Normalize question to UI shape
 const normalizeQuestion = (q) => ({
   ...q,
   id: q.id,
-  type: q.type || q.question_type || 'MCQ',
+  type: normalizeQuestionType(q.type || q.question_type || 'MCQ'),
   question: q.question || q.question_text || q.question_text_si || q.question_text_ta || '',
   answer: q.answer || q.correct_answer || '',
   options: Array.isArray(q.options) ? q.options : [],
@@ -21,13 +35,6 @@ const normalizeQuestion = (q) => ({
   generated: q.generated !== undefined ? q.generated : true
 });
 
-/**
- * Generate questions from uploaded file
- * @param {string} fileUrl - Public URL of uploaded file
- * @param {string} fileType - File type (image, pdf, document)
- * @param {Object} options - Generation options
- * @returns {Promise<Array>} - Generated questions
- */
 export const generateQuestionsFromFile = async (fileUrl, fileType, options = {}) => {
   try {
     const {
@@ -45,9 +52,7 @@ export const generateQuestionsFromFile = async (fileUrl, fileType, options = {})
 
     const response = await fetch(`${API_BASE_URL}/questions/generate-from-file`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify({
         fileUrl,
@@ -55,14 +60,14 @@ export const generateQuestionsFromFile = async (fileUrl, fileType, options = {})
         pack_id,
         count,
         difficulty,
-        types,
+        types: Array.isArray(types) ? types.map(normalizeQuestionType) : ['MCQ', 'FIIB', 'TF', 'HOQ'],
         language,
         bloom_level
       })
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to generate questions');
     }
 
@@ -79,9 +84,6 @@ export const generateQuestionsFromFile = async (fileUrl, fileType, options = {})
   }
 };
 
-/**
- * Get summary by pack_id
- */
 export const getSummaryByPack = async (pack_id) => {
   try {
     const res = await fetch(`${API_BASE_URL}/questions/summaries/${pack_id}`);
@@ -98,9 +100,6 @@ export const getSummaryByPack = async (pack_id) => {
   }
 };
 
-/**
- * Upsert summary bullets by pack_id
- */
 export const upsertSummaryByPack = async (pack_id, bullets) => {
   try {
     const res = await fetch(`${API_BASE_URL}/questions/summaries/${pack_id}`, {
@@ -121,23 +120,16 @@ export const upsertSummaryByPack = async (pack_id, bullets) => {
   }
 };
 
-/**
- * Create a single manual question
- * @param {Object} payload - { pack_id, type, difficulty, question, answer, options, language, blooms_taxonomy }
- * @returns {Promise<Object>} - Created question (UI shape)
- */
 export const createQuestion = async (payload) => {
   try {
     const response = await fetch(`${API_BASE_URL}/questions`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload)
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, type: normalizeQuestionType(payload?.type) })
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to create question');
     }
 
@@ -149,12 +141,6 @@ export const createQuestion = async (payload) => {
   }
 };
 
-/**
- * Generate questions from text content
- * @param {string} content - Text content
- * @param {Object} options - Generation options
- * @returns {Promise<Array>} - Generated questions
- */
 export const generateQuestionsFromText = async (content, options = {}) => {
   try {
     const {
@@ -165,49 +151,41 @@ export const generateQuestionsFromText = async (content, options = {}) => {
 
     const response = await fetch(`${API_BASE_URL}/questions/generate`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         content,
         count,
         difficulty,
-        types
+        types: Array.isArray(types) ? types.map(normalizeQuestionType) : ['MCQ']
       })
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to generate questions');
     }
 
     const data = await response.json();
-    return data.questions;
-
+    return (data.questions || []).map(normalizeQuestion);
   } catch (error) {
     console.error('[Frontend API] Generate questions error:', error);
     throw error;
   }
 };
 
-/**
- * Update question
- * @param {string} questionId - Question ID
- * @param {Object} updates - Fields to update
- * @returns {Promise<Object>} - Updated question
- */
 export const updateQuestion = async (questionId, updates) => {
   try {
+    const payload = { ...updates };
+    if (payload.type) payload.type = normalizeQuestionType(payload.type);
+
     const response = await fetch(`${API_BASE_URL}/questions/${questionId}`, {
       method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(updates)
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to update question');
     }
 
@@ -219,24 +197,16 @@ export const updateQuestion = async (questionId, updates) => {
   }
 };
 
-/**
- * Update question difficulty
- * @param {string} questionId - Question ID
- * @param {string} difficulty - New difficulty
- * @returns {Promise<Object>} - Updated question
- */
 export const updateQuestionDifficulty = async (questionId, difficulty) => {
   try {
     const response = await fetch(`${API_BASE_URL}/questions/${questionId}/difficulty`, {
       method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ difficulty })
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to update difficulty');
     }
 
@@ -248,19 +218,12 @@ export const updateQuestionDifficulty = async (questionId, difficulty) => {
   }
 };
 
-/**
- * Delete question
- * @param {string} questionId - Question ID
- * @returns {Promise<void>}
- */
 export const deleteQuestion = async (questionId) => {
   try {
-    const response = await fetch(`${API_BASE_URL}/questions/${questionId}`, {
-      method: 'DELETE'
-    });
+    const response = await fetch(`${API_BASE_URL}/questions/${questionId}`, { method: 'DELETE' });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to delete question');
     }
   } catch (error) {
@@ -270,23 +233,24 @@ export const deleteQuestion = async (questionId) => {
 };
 
 export const previewFromFile = async (fileUrl, fileType, options = {}) => {
-  // If questionTypes is provided, use it as the counts object
-  const counts = options.questionTypes || {};
-  
+  const counts = normalizeCounts(options.questionTypes || options.counts || {});
+
   const payload = {
     fileUrl,
     fileType,
     language: options.language,
-    grade: options.grade,        // Add grade to payload
-    subject: options.subject,    // Add subject to payload
-    counts,                     // This will be used by the backend
+    grade: options.grade,
+    subject: options.subject,
+    counts,
     difficulty: options.difficulty,
-    types: Object.keys(counts).filter(k => counts[k] > 0), // Only include types with count > 0
+    typeDifficulties: options.typeDifficulties || {},
+    types: Object.keys(counts).filter(k => counts[k] > 0),
     bloom_level: options.bloom_level,
-    packTitle: options.packTitle || '',       // Add pack title for focused generation
-    packDescription: options.packDescription || ''  // Add pack description for context
+    generationStyle: options.generationStyle || 'Exam Paper Style',
+    packTitle: options.packTitle || '',
+    packDescription: options.packDescription || ''
   };
-  
+
   const res = await fetch(`${API_BASE_URL}/questions/preview-from-file`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -310,11 +274,15 @@ export const previewFromFile = async (fileUrl, fileType, options = {}) => {
 };
 
 export const approveFromPreview = async ({ pack_id, questions, summary_bullets, language, difficulty, bloom_level }) => {
+  const normalizedQuestions = Array.isArray(questions)
+    ? questions.map(q => ({ ...q, type: normalizeQuestionType(q.type || q.question_type) }))
+    : [];
+
   const res = await fetch(`${API_BASE_URL}/questions/approve-from-preview`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ pack_id, questions, summary_bullets, language, difficulty, bloom_level })
+    body: JSON.stringify({ pack_id, questions: normalizedQuestions, summary_bullets, language, difficulty, bloom_level })
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
