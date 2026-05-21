@@ -10,6 +10,13 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const normalizeQuestionType = (type) => {
+  const normalized = String(type || 'MCQ').trim().toUpperCase();
+  return normalized === 'FIB' ? 'FIIB' : normalized;
+};
+
+const normalizeQuestionText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+
 // Supabase Configuration (Backend - Server Side)
 const supabaseUrl = process.env.SUPABASE_URL || ""; // require explicit .env
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || ""; // require service role for server
@@ -147,12 +154,12 @@ export const deleteStudent = async (studentId) => {
 export const saveQuestions = async (questions) => {
   try {
     // Prepare questions for database with your schema
-    const questionsToSave = questions.map(q => ({
+    const prepared = questions.map(q => ({
       pack_id: q.pack_id,
-      question_text: q.question_text || q.question || '', // ← ALWAYS set question_text
+      question_text: normalizeQuestionText(q.question_text || q.question || ''), // ALWAYS set question_text
       question_text_si: q.question_text_si || null,
       question_text_ta: q.question_text_ta || null,
-      question_type: q.question_type || q.type || 'MCQ',
+      question_type: normalizeQuestionType(q.question_type || q.type || 'MCQ'),
       options: Array.isArray(q.options) ? q.options : [],
       correct_answer: q.correct_answer || q.answer || '',
       explanation: q.explanation || '',
@@ -164,7 +171,42 @@ export const saveQuestions = async (questions) => {
       display_order: q.display_order || 0,
       difficulty: q.difficulty || 'Medium',
       generated: q.generated === undefined ? true : !!q.generated
-    }));
+    })).filter(q => q.pack_id && q.question_text);
+
+    // Remove duplicates inside the same request first.
+    const seenInRequest = new Set();
+    const dedupedInRequest = prepared.filter(q => {
+      const key = `${q.pack_id}::${q.question_text.toLowerCase()}`;
+      if (seenInRequest.has(key)) return false;
+      seenInRequest.add(key);
+      return true;
+    });
+
+    // Prevent duplicate saves against existing database rows: same pack_id + same question_text.
+    const packIds = [...new Set(dedupedInRequest.map(q => q.pack_id))];
+    let existingKeys = new Set();
+
+    if (packIds.length) {
+      const { data: existing, error: existingError } = await supabaseAdmin
+        .from('questions')
+        .select('pack_id, question_text')
+        .in('pack_id', packIds);
+
+      if (existingError) throw existingError;
+
+      existingKeys = new Set((existing || []).map(row => (
+        `${row.pack_id}::${normalizeQuestionText(row.question_text).toLowerCase()}`
+      )));
+    }
+
+    const questionsToSave = dedupedInRequest.filter(q => (
+      !existingKeys.has(`${q.pack_id}::${q.question_text.toLowerCase()}`)
+    ));
+
+    if (!questionsToSave.length) {
+      console.warn('[Backend DB] No new questions to save after duplicate check');
+      return [];
+    }
 
     const { data, error } = await supabaseAdmin
       .from('questions')
@@ -214,7 +256,7 @@ export const getAllQuestions = async (filters = {}) => {
     if (filters.subject_id) {
       query = query.eq('learning_packs.subject_id', filters.subject_id);
     }
-    if (filters.type) query = query.eq('question_type', filters.type);
+    if (filters.type) query = query.eq('question_type', normalizeQuestionType(filters.type));
     if (filters.difficulty) query = query.eq('difficulty', filters.difficulty);
 
     // Add sorting
@@ -252,9 +294,18 @@ export const getAllQuestions = async (filters = {}) => {
  */
 export const updateQuestion = async (questionId, updates) => {
   try {
+    const normalizedUpdates = { ...updates };
+    if (normalizedUpdates.question_type || normalizedUpdates.type) {
+      normalizedUpdates.question_type = normalizeQuestionType(normalizedUpdates.question_type || normalizedUpdates.type);
+      delete normalizedUpdates.type;
+    }
+    if (normalizedUpdates.question_text) {
+      normalizedUpdates.question_text = normalizeQuestionText(normalizedUpdates.question_text);
+    }
+
     const { data, error } = await supabaseAdmin
       .from('questions')
-      .update(updates)
+      .update(normalizedUpdates)
       .eq('id', questionId)
       .select()
       .single();
