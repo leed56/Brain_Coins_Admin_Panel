@@ -9,14 +9,66 @@ import {
   upsertSummaryByPack
 } from '../services/supabaseService.js';
 import { getLearningPackWithSubject, createLearningPack } from '../services/learningPackService.js';
+
+const ALLOWED_TYPES = ['MCQ', 'FIIB', 'TF', 'HOQ'];
+
+const normalizeQuestionType = (type) => {
+  const normalized = String(type || 'MCQ').trim().toUpperCase();
+  return normalized === 'FIB' ? 'FIIB' : normalized;
+};
+
+const normalizeCounts = (countsObj = {}) => {
+  const normalizedCounts = { MCQ: 0, FIIB: 0, TF: 0, HOQ: 0 };
+
+  Object.entries(countsObj || {}).forEach(([rawType, rawCount]) => {
+    const type = normalizeQuestionType(rawType);
+    if (!ALLOWED_TYPES.includes(type)) return;
+    const count = parseInt(rawCount, 10);
+    normalizedCounts[type] = Math.max(0, Number.isNaN(count) ? 0 : count);
+  });
+
+  return normalizedCounts;
+};
+
+const getRequestedTypes = (normalizedCounts, types = []) => {
+  const fromCounts = ALLOWED_TYPES.filter(type => normalizedCounts[type] > 0);
+  if (fromCounts.length) return fromCounts;
+
+  const fromTypes = Array.isArray(types)
+    ? types.map(normalizeQuestionType).filter(type => ALLOWED_TYPES.includes(type))
+    : [];
+
+  return fromTypes.length ? [...new Set(fromTypes)] : ALLOWED_TYPES;
+};
+
+const buildQuestionSavePayload = ({ q, index, pack_id, language, difficulty, bloom_level, fallbackDifficulty }) => {
+  const explanationText = q.explanation || q.reasoning || q.explanations || '';
+  const questionText = q.question || q.question_text || `Question ${index + 1}`;
+  const languageFields = mapLanguageFields(language, questionText, explanationText);
+
+  return {
+    pack_id,
+    question_type: normalizeQuestionType(q.type || q.question_type || 'MCQ'),
+    options: Array.isArray(q.options) ? q.options : [],
+    correct_answer: q.answer || q.correct_answer || '',
+    has_diagram: false,
+    diagram_path: null,
+    blooms_taxonomy: q.blooms_taxonomy || q.bloom || bloom_level || 'Understand',
+    display_order: index + 1,
+    difficulty: q.difficulty || difficulty || fallbackDifficulty || 'Medium',
+    generated: true,
+    metadata: q.metadata || {},
+    ...languageFields
+  };
+};
+
 // Helper: Map language-specific fields
 const mapLanguageFields = (language, questionText, explanationText) => {
-  // ALWAYS store question in question_text regardless of language
   return {
-    question_text: questionText, // ← ALWAYS use this column
+    question_text: questionText,
     question_text_si: language === 'Sinhala' ? questionText : null,
     question_text_ta: language === 'Tamil' ? questionText : null,
-    explanation: explanationText, // ← ALWAYS use this column
+    explanation: explanationText,
     explanation_si: language === 'Sinhala' ? explanationText : null,
     explanation_ta: language === 'Tamil' ? explanationText : null
   };
@@ -31,25 +83,26 @@ export const generateQuestionsHandler = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Content and pack_id are required' });
     }
 
+    const safeCount = Math.min(Math.max(parseInt(count, 10) || 5, 1), 50);
+
     const questions = await generateQuestions(content, {
-      count: Math.min(parseInt(count) || 5, 20),
+      count: safeCount,
       difficulty: difficulty || 'Medium',
-      type: type || 'MCQ'
+      type: normalizeQuestionType(type || 'MCQ')
     });
 
-    const questionsToSave = questions.map(q => ({
-      ...q,
+    const questionsToSave = questions.map((q, index) => buildQuestionSavePayload({
+      q,
+      index,
       pack_id,
-      question_text: q.question,
-      correct_answer: q.answer,
-      display_order: 0,
-      has_diagram: false,
-      blooms_taxonomy: 'Remember',
-      metadata: q.metadata || {}
+      language: req.body.language || 'English',
+      difficulty,
+      bloom_level: req.body.bloom_level || 'Remember',
+      fallbackDifficulty: 'Medium'
     }));
 
     const savedQuestions = await saveQuestions(questionsToSave);
-    res.json({ success: true, questions: savedQuestions, count: savedQuestions.length });
+    res.json({ success: true, questions: savedQuestions, count: savedQuestions.length, requested: safeCount });
 
   } catch (error) {
     console.error('[Backend] Generate questions error:', error);
@@ -71,7 +124,7 @@ export const createQuestionHandler = async (req, res) => {
 
     const base = {
       pack_id,
-      question_type: type,
+      question_type: normalizeQuestionType(type),
       options: Array.isArray(options) ? options : [],
       correct_answer: answer,
       explanation: req.body.explanation || '',
@@ -86,6 +139,10 @@ export const createQuestionHandler = async (req, res) => {
     const languageFields = mapLanguageFields(language, question, req.body.explanation || '');
     const [saved] = await saveQuestions([{ ...base, ...languageFields }]);
 
+    if (!saved) {
+      return res.status(409).json({ success: false, error: 'Duplicate question skipped. This question already exists in the selected learning pack.' });
+    }
+
     return res.status(201).json({ success: true, question: saved });
   } catch (error) {
     console.error('[Backend] Create question error:', error);
@@ -96,48 +153,33 @@ export const createQuestionHandler = async (req, res) => {
 // POST /api/questions/preview-from-file - Generate preview without saving
 export const generatePreviewFromFileHandler = async (req, res) => {
   try {
-    const { fileUrl, fileType, language, grade, subject, counts, difficulty, bloom_level, typeDifficulties, packTitle, packDescription } = req.body || {};
+    const {
+      fileUrl, fileType, language, grade, subject, counts, difficulty,
+      bloom_level, typeDifficulties, packTitle, packDescription, generationStyle
+    } = req.body || {};
 
     if (!fileUrl || !fileType) {
       return res.status(400).json({ success: false, error: 'fileUrl and fileType are required' });
     }
 
-    const allowedTypes = ['MCQ', 'FIIB', 'TF', 'HOQ'];
-    const countsObj = counts || req.body.questionTypes || {};
+    const normalizedCounts = normalizeCounts(counts || req.body.questionTypes || {});
+    const requestedTypes = getRequestedTypes(normalizedCounts, req.body.types);
+    const totalRequested = requestedTypes.reduce((sum, type) => sum + (normalizedCounts[type] || 0), 0);
 
-    // Normalize counts
-    const normalizedCounts = {};
-    let hasValidCounts = false;
-
-    for (const type of allowedTypes) {
-      const count = parseInt(countsObj[type], 10);
-      if (!isNaN(count) && count > 0) {
-        normalizedCounts[type] = count;
-        hasValidCounts = true;
-      } else {
-        normalizedCounts[type] = 0;
-      }
-    }
-
-    const requestedTypes = allowedTypes.filter(t => normalizedCounts[t] > 0);
-
-    if (!hasValidCounts) {
+    if (totalRequested <= 0) {
       return res.status(400).json({
         success: false,
-        error: 'At least one question type with count > 0 is required'
+        error: 'At least one question type with count greater than 0 is required'
       });
     }
 
-    const totalRequested = requestedTypes.reduce((sum, t) => sum + normalizedCounts[t], 0);
-
-    // Generate questions
     console.log('[Preview] Generating questions with params:', {
-      fileUrl: fileUrl.substring(0, 100),
       fileType,
       totalRequested,
       difficulty,
       requestedTypes,
-      language
+      language,
+      generationStyle: generationStyle || 'Exam Paper Style'
     });
 
     let gen;
@@ -151,35 +193,29 @@ export const generatePreviewFromFileHandler = async (req, res) => {
         grade: grade || 'Unknown',
         subject: subject || 'Unknown',
         bloom_level: bloom_level || 'Understand',
+        generationStyle: generationStyle || 'Exam Paper Style',
         packTitle: packTitle || '',
         packDescription: packDescription || ''
       });
     } catch (genError) {
-      console.error('[Preview] ❌ Error from generateQuestionsFromFile:', {
-        message: genError.message,
-        stack: genError.stack
-      });
+      console.error('[Preview] Error from generateQuestionsFromFile:', genError);
       return res.status(500).json({
         success: false,
-        error: `Question generation failed: ${genError.message}. Please check your file and try again.`
+        error: `Question generation failed: ${genError.message}. Please check your file, Gemini key, and generation settings.`
       });
     }
-
-    console.log('[Preview] Generated questions count:', gen?.length || 0);
 
     if (!Array.isArray(gen) || gen.length === 0) {
-      console.error('[Preview] No questions generated. Response:', gen);
       return res.status(500).json({
         success: false,
-        error: 'No questions were generated from the file. The content may be too short or unclear. Please try a different file.'
+        error: 'No questions were generated from the file. The content may be too short, unclear, or the selected learning pack may not match the file.'
       });
     }
 
-    // Group and select questions by type
     const questionsByType = { MCQ: [], FIIB: [], TF: [], HOQ: [] };
     gen.forEach(q => {
-      const type = (q.type || q.question_type || 'MCQ').toUpperCase();
-      if (questionsByType[type]) questionsByType[type].push(q);
+      const type = normalizeQuestionType(q.type || q.question_type || 'MCQ');
+      if (questionsByType[type]) questionsByType[type].push({ ...q, type });
     });
 
     const selected = [];
@@ -187,7 +223,6 @@ export const generatePreviewFromFileHandler = async (req, res) => {
       const available = questionsByType[type] || [];
       const typeDifficulty = (typeDifficulties && typeDifficulties[type]) || difficulty || 'Medium';
       const countToTake = Math.min(available.length, normalizedCounts[type]);
-
       selected.push(...available.slice(0, countToTake).map(q => ({ ...q, difficulty: typeDifficulty })));
     }
 
@@ -212,7 +247,10 @@ export const generatePreviewFromFileHandler = async (req, res) => {
 // POST /api/questions/generate-from-file - Generate and save questions from file
 export const generateQuestionsFromFileHandler = async (req, res) => {
   try {
-    const { fileUrl, fileType, pack_id, count, difficulty, types, language, bloom_level } = req.body;
+    const {
+      fileUrl, fileType, pack_id, count, counts, difficulty,
+      types, language, bloom_level, generationStyle
+    } = req.body;
 
     if (!fileUrl || !fileType) {
       return res.status(400).json({ success: false, error: 'fileUrl and fileType are required' });
@@ -221,7 +259,6 @@ export const generateQuestionsFromFileHandler = async (req, res) => {
     let effectivePackId = pack_id;
     let learningPack;
 
-    // Create pack if not provided
     if (!effectivePackId) {
       const { subject_id, grade, pack_title, pack_description, pack_difficulty } = req.body;
 
@@ -250,46 +287,41 @@ export const generateQuestionsFromFileHandler = async (req, res) => {
       }
     }
 
-    const allowedTypes = ['MCQ', 'FIIB', 'TF', 'HOQ'];
-    const reqTypes = Array.isArray(types) && types.length ? types : allowedTypes;
-    const filteredTypes = reqTypes.filter(t => allowedTypes.includes(t));
+    const normalizedCounts = normalizeCounts(counts || req.body.questionTypes || {});
+    const hasPerTypeCounts = Object.values(normalizedCounts).some(v => v > 0);
+    const filteredTypes = getRequestedTypes(normalizedCounts, types);
+    const totalRequested = hasPerTypeCounts
+      ? filteredTypes.reduce((sum, type) => sum + (normalizedCounts[type] || 0), 0)
+      : Math.min(Math.max(parseInt(count, 10) || 5, 1), 50);
 
     const questions = await generateQuestionsFromFile(fileUrl, fileType, {
-      count: Math.min(parseInt(count) || 5, 20),
+      count: totalRequested,
+      counts: hasPerTypeCounts ? normalizedCounts : undefined,
       difficulty: difficulty || learningPack.difficulty || 'Medium',
-      types: filteredTypes.length ? filteredTypes : allowedTypes,
+      types: filteredTypes.length ? filteredTypes : ALLOWED_TYPES,
       language,
-      bloom_level
+      bloom_level,
+      generationStyle: generationStyle || 'Exam Paper Style',
+      packTitle: learningPack?.title || '',
+      packDescription: learningPack?.description || ''
     });
 
-    // Format questions for saving
-    const questionsToSave = questions.map((q, idx) => {
-      const explanationText = q.explanation || q.reasoning || '';
-      const languageFields = mapLanguageFields(language, q.question || q.question_text || '', explanationText);
-
-      return {
-        pack_id: effectivePackId,
-        question_type: q.type || q.question_type || 'MCQ',
-        options: Array.isArray(q.options) ? q.options : [],
-        correct_answer: q.answer || q.correct_answer || '',
-        has_diagram: false,
-        diagram_path: null,
-        blooms_taxonomy: q.blooms_taxonomy || bloom_level || 'Understand',
-        display_order: idx + 1,
-        difficulty: q.difficulty || difficulty || learningPack.difficulty || 'Medium',
-        generated: true,
-        ...languageFields // ← This ensures question_text is always set
-      };
-    });
+    const questionsToSave = questions.map((q, idx) => buildQuestionSavePayload({
+      q,
+      index: idx,
+      pack_id: effectivePackId,
+      language,
+      difficulty,
+      bloom_level,
+      fallbackDifficulty: learningPack.difficulty || 'Medium'
+    }));
 
     const savedQuestions = await saveQuestions(questionsToSave);
 
-    // Get pack title and description for focused summary generation
     const packTitle = learningPack?.title || '';
     const packDescription = learningPack?.description || '';
     const summary_bullets = await generateSummaryFromFile(fileUrl, fileType, language || 'English', packTitle, packDescription);
 
-    // Save summary
     let saved_summary = null;
     if (Array.isArray(summary_bullets) && summary_bullets.length) {
       try {
@@ -305,6 +337,8 @@ export const generateQuestionsFromFileHandler = async (req, res) => {
       summary_bullets,
       saved_summary,
       count: savedQuestions.length,
+      requested: totalRequested,
+      skipped_duplicates: questionsToSave.length - savedQuestions.length,
       pack_id: effectivePackId,
       subject_id: learningPack.subject_id,
       source: 'file',
@@ -325,7 +359,7 @@ export const getAllQuestionsHandler = async (req, res) => {
     const { data: questions, count } = await getAllQuestions({
       pack_id,
       subject_id,
-      type,
+      type: type ? normalizeQuestionType(type) : undefined,
       difficulty,
       page: parseInt(page),
       limit: Math.min(parseInt(limit), 100)
@@ -367,10 +401,9 @@ export const updateQuestionHandler = async (req, res) => {
       ...rest,
       ...(uiQuestion && { question_text: uiQuestion }),
       ...(uiAnswer && { correct_answer: uiAnswer }),
-      ...(uiType && { question_type: uiType })
+      ...(uiType && { question_type: normalizeQuestionType(uiType) })
     };
 
-    // Handle language-specific fields for question and explanation
     if (language && (uiQuestion || explanation)) {
       const languageFields = mapLanguageFields(
         language,
@@ -379,7 +412,6 @@ export const updateQuestionHandler = async (req, res) => {
       );
       mappedUpdates = { ...mappedUpdates, ...languageFields };
     } else if (explanation) {
-      // If no language specified, just update the main explanation field
       mappedUpdates.explanation = explanation;
     }
 
@@ -455,7 +487,7 @@ export const upsertSummaryByPackHandler = async (req, res) => {
 // POST /api/questions/approve-from-preview - Save previewed questions
 export const approveFromPreviewHandler = async (req, res) => {
   try {
-    const { pack_id, questions, summary, summary_bullets, language } = req.body;
+    const { pack_id, questions, summary, summary_bullets, language, difficulty, bloom_level } = req.body;
     const summaryToSave = summary || summary_bullets;
 
     if (!pack_id) {
@@ -466,31 +498,18 @@ export const approveFromPreviewHandler = async (req, res) => {
       return res.status(400).json({ success: false, error: 'questions array is required and must not be empty' });
     }
 
-    // Format questions for saving
-    const questionsToSave = questions.map((q, index) => {
-      const explanationText = q.explanation || q.reasoning || '';
-      const languageFields = mapLanguageFields(language, q.question_text || q.question || `Question ${index + 1}`, explanationText);
-
-      return {
-        pack_id,
-        question_type: q.question_type || q.type || 'MCQ',
-        has_diagram: false,
-        diagram_path: null,
-        blooms_taxonomy: q.blooms_taxonomy || q.bloom || 'Remember',
-        display_order: index,
-        difficulty: q.difficulty || 'Medium',
-        generated: true,
-        created_at: new Date().toISOString(),
-        metadata: q.metadata || {},
-        correct_answer: q.correct_answer || q.answer || '',
-        options: Array.isArray(q.options) ? q.options : [],
-        ...languageFields // ← This ensures question_text is always set
-      };
-    });
+    const questionsToSave = questions.map((q, index) => buildQuestionSavePayload({
+      q,
+      index,
+      pack_id,
+      language,
+      difficulty,
+      bloom_level,
+      fallbackDifficulty: 'Medium'
+    }));
 
     const savedQuestions = await saveQuestions(questionsToSave);
 
-    // Save summary if provided
     if (summaryToSave && Array.isArray(summaryToSave) && summaryToSave.length > 0) {
       await upsertSummaryByPack(pack_id, summaryToSave);
     }
@@ -499,6 +518,7 @@ export const approveFromPreviewHandler = async (req, res) => {
       success: true,
       questions: savedQuestions,
       count: savedQuestions.length,
+      skipped_duplicates: questionsToSave.length - savedQuestions.length,
       pack_id
     };
 
@@ -511,7 +531,7 @@ export const approveFromPreviewHandler = async (req, res) => {
     console.error('[Backend] Approve from preview error:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to approve questions',
+      error: error.message || 'Failed to approve questions',
       details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
   }
@@ -524,7 +544,7 @@ export const uploadQuestionDiagramHandler = async (req, res) => {
 
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+    limits: { fileSize: 5 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
       const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/svg+xml', 'image/webp', 'image/bmp'];
       if (allowedTypes.includes(file.mimetype)) {
