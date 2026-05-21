@@ -11,12 +11,14 @@ import contentManagementRoute from './routes/contentManagement.routes.js'
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.PORT || 5000;
 
 // CORS configuration for frontend domains
 const allowedOrigins = [
     'http://localhost:3000',
-    'https://braincoins.vercel.app'
+    'http://localhost:5173',
+    'https://braincoins.vercel.app',
+    'https://braincoinsadmin.vercel.app'
 ];
 
 app.use(cors({
